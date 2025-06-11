@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>מערכת ניהול משימות</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, onSnapshot, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase configuration and app ID are provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let currentUserId = null;
+        let isAuthReady = false;
+
+        async function initFirebase() {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        console.log("Authenticated as:", currentUserId);
+                    } else {
+                        console.log("No user signed in. Attempting anonymous sign-in or custom token sign-in.");
+                        try {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(auth, initialAuthToken);
+                                currentUserId = auth.currentUser.uid;
+                                console.log("Signed in with custom token as:", currentUserId);
+                            } else {
+                                await signInAnonymously(auth);
+                                currentUserId = auth.currentUser.uid;
+                                console.log("Signed in anonymously as:", currentUserId);
+                            }
+                        } catch (anonymousError) {
+                            console.error("Failed to sign in anonymously or with custom token:", anonymousError);
+                            // Fallback if anonymous sign-in also fails (e.g., no internet or Firebase issues)
+                            currentUserId = 'anonymous_user_' + Math.random().toString(36).substr(2, 9); // Generate a temporary ID
+                            console.warn("Using a temporary local user ID due to sign-in failure:", currentUserId);
+                        }
+                    }
+                    isAuthReady = true;
+                    // Now that auth is ready, proceed with data loading
+                    window.dispatchEvent(new CustomEvent('firebaseAuthReady'));
+                    document.getElementById('current-user-id').innerText = currentUserId; // Display user ID
+                });
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                // Handle Firebase initialization errors gracefully
+                currentUserId = 'init_error_user_' + Math.random().toString(36).substr(2, 9); // Fallback ID
+                isAuthReady = true;
+                window.dispatchEvent(new CustomEvent('firebaseAuthReady'));
+                document.getElementById('current-user-id').innerText = currentUserId; // Display user ID
+            }
+        }
+
+        // Expose Firebase objects globally for use in the main script
+        window.firebaseApp = app;
+        window.firebaseDb = db;
+        window.firebaseAuth = auth;
+        window.getCurrentUserId = () => currentUserId;
+        window.isFirebaseAuthReady = () => isAuthReady;
+        
+        initFirebase();
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Assistant:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Chosen Palette: "Teal & Warm Gray" -->
+    <!-- Application Structure Plan: A tab-based Single Page Application (SPA) structure was chosen to provide a clear and intuitive user flow. Users can switch between a primary "Partner" role and a "Worker" role. The Partner view includes three main sections accessible via tabs: a comprehensive Dashboard with visualizations, a main Tasks view with advanced filtering, and a Settings panel. The Worker view is simplified, showing only their assigned tasks. This structure directly maps to the user roles and permissions defined in the source report, making navigation logical and efficient. The core interaction revolves around filtering data, viewing details in a modal, and observing how the dashboard visualizations react to data changes, providing a holistic and interactive overview of the system's state. -->
+    <!-- Visualization & Content Choices: 
+        - Report Info: Overall task status distribution for all workers. Goal: Compare proportions. Viz: Donut Chart (Chart.js). Interaction: Hover for tooltips showing exact numbers. Justification: A donut chart is ideal for showing part-to-whole relationships clearly and visually, fitting the 'colorful and dynamic' requirement.
+        - Report Info: Task load comparison between workers. Goal: Compare quantities. Viz: Bar Chart (Chart.js). Interaction: Hover for tooltips. Justification: A bar chart provides the clearest and most direct comparison of discrete counts (tasks per worker) across different categories (the workers).
+        - Report Info: Main task list for all user types. Goal: Organize & Inform. Presentation: Interactive card-based grid (HTML/Tailwind). Interaction: Filtering via dropdowns, searching by text, clicking a card to open an edit modal. Justification: Cards are more visually engaging than a simple table and allow for flexible presentation of information, including color-coded status badges, which was a key requirement.
+        - Report Info: Creating/Editing a task. Goal: User Input. Presentation: Modal form. Interaction: Form submission. Justification: A modal keeps the user in the context of the main page, aligning with the goal of a simple, streamlined process.
+    -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+    <style>
+        body { font-family: 'Assistant', sans-serif; }
+        .chart-container { position: relative; width: 100%; max-width: 500px; margin: auto; height: 320px; max-height: 40vh; }
+        @media (min-width: 768px) { .chart-container { height: 350px; } }
+        .modal-bg { display: none; }
+        .loading-spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: none;
+            margin-inline-start: 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* Style for the autocomplete list */
+        .autocomplete-items {
+            position: absolute;
+            border: 1px solid #d4d4d4;
+            border-bottom: none;
+            border-top: none;
+            z-index: 99;
+            top: 100%;
+            left: 0;
+            right: 0;
+        }
+
+        .autocomplete-items div {
+            padding: 10px;
+            cursor: pointer;
+            background-color: #fff;
+            border-bottom: 1px solid #d4d4d4;
+        }
+
+        .autocomplete-items div:hover {
+            background-color: #e9e9e9;
+        }
+
+        .autocomplete-active {
+            background-color: DodgerBlue !important;
+            color: #ffffff;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+
+    <div id="app" class="container mx-auto p-4 sm:p-6 lg:p-8">
+
+        <!-- Header -->
+        <header class="mb-8">
+            <div class="flex flex-col sm:flex-row justify-between items-center mb-4">
+                <h1 class="text-3xl font-bold text-teal-600 mb-2 sm:mb-0">🚀 מערכת ניהול משימות</h1>
+                <div class="flex items-center text-sm text-slate-500 mb-2 sm:mb-0">
+                    <span class="font-semibold">ID משתמש נוכחי: </span>
+                    <span id="current-user-id" class="font-bold text-teal-700 me-4">טוען...</span>
+                </div>
+                <div class="flex items-center space-i-4 bg-slate-200 p-1 rounded-lg">
+                    <span class="font-semibold">תצוגה לפי:</span>
+                    <div id="user-role-switcher" class="flex items-center space-i-2">
+                        <button data-role="partner" class="user-role-btn bg-teal-500 text-white px-3 py-1 rounded-md">שותף</button>
+                        <button data-role="worker" class="user-role-btn bg-transparent text-slate-600 px-3 py-1 rounded-md">עובד</button>
+                    </div>
+                </div>
+            </div>
+             <p class="text-slate-600 text-center sm:text-right">אפליקציה זו מדגימה את התכונות המרכזיות של מערכת ניהול המשימות. ניתן לעבור בין תצוגת 'שותף' (עם גישה מלאה) לתצוגת 'עובד' (עם גישה למשימות אישיות בלבד) כדי לראות את ההבדלים בפונקציונליות ובמידע המוצג.</p>
+        </header>
+
+        <!-- Navigation Tabs (Partner-only) -->
+        <nav id="partner-nav" class="mb-6">
+            <div class="border-b border-slate-300">
+                <div class="flex space-i-4 -mb-px">
+                    <button data-view="dashboard" class="nav-tab border-b-2 border-teal-500 text-teal-600 py-3 px-4 font-semibold">📊 דשבורד</button>
+                    <button data-view="tasks" class="nav-tab border-transparent text-slate-500 hover:text-teal-600 hover:border-slate-400 py-3 px-4 font-semibold">📋 משימות</button>
+                    <button data-view="settings" class="nav-tab border-transparent text-slate-500 hover:text-teal-600 hover:border-slate-400 py-3 px-4 font-semibold">⚙️ הגדרות</button>
+                </div>
+            </div>
+        </nav>
+
+        <main id="main-content">
+            <!-- Dashboard View -->
+            <div id="dashboard-view" class="view-content">
+                <p class="text-slate-600 mb-6 text-lg">דשבורד זה מספק מבט-על אינטראקטיבי על כלל המשימות במערכת. הגרפים מציגים התפלגות של משימות לפי סטטוס ועומס עבודה לפי עובד, ומאפשרים לזהות בקלות צווארי בקבוק ומגמות.</p>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    <div class="bg-white p-6 rounded-xl shadow-md flex flex-col">
+                        <h3 class="text-xl font-bold mb-4 text-center">התפלגות משימות לפי סטטוס</h3>
+                        <div class="chart-container flex-grow">
+                            <canvas id="statusChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md flex flex-col">
+                        <h3 class="text-xl font-bold mb-4 text-center">משימות פתוחות לפי עובד</h3>
+                        <div class="chart-container flex-grow">
+                            <canvas id="tasksPerWorkerChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tasks View -->
+            <div id="tasks-view" class="view-content hidden">
+                 <p id="tasks-view-intro" class="text-slate-600 mb-6 text-lg">כאן ניתן לנהל ולצפות בכל המשימות. השתמשו בסננים כדי למצוא בקלות את המשימות הרלוונטיות, ולחצו על כפתור "הוסף משימה" כדי ליצור משימה חדשה.</p>
+                <div class="bg-white p-4 rounded-xl shadow-md mb-6 flex flex-wrap gap-4 items-center justify-between">
+                    <div class="flex flex-wrap gap-4">
+                        <select id="status-filter" class="filter-input bg-slate-100 border-slate-300 rounded-md p-2">
+                            <option value="">כל הסטטוסים</option>
+                        </select>
+                        <select id="priority-filter" class="filter-input bg-slate-100 border-slate-300 rounded-md p-2">
+                            <option value="">כל העדיפויות</option>
+                        </select>
+                        <select id="worker-filter" class="filter-input bg-slate-100 border-slate-300 rounded-md p-2">
+                            <option value="">כל העובדים</option>
+                        </select>
+                    </div>
+                    <button id="add-task-btn" class="bg-teal-500 hover:bg-teal-600 text-white font-bold py-2 px-4 rounded-lg transition duration-300">הוסף משימה +</button>
+                </div>
+
+                <div id="task-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                </div>
+            </div>
+            
+            <!-- Settings View -->
+            <div id="settings-view" class="view-content hidden">
+                 <p class="text-slate-600 mb-6 text-lg">מסך זה מאפשר למנהלי המערכת (שותפים) לנהל את המשאבים המרכזיים של המערכת. כאן ניתן להוסיף, לערוך או למחוק עובדים, שותפים וסוגי משימות, כדי להתאים את המערכת לצרכים המשתנים של הארגון. רשימת הלקוחות מסונכרנת אוטומטית.</p>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="text-xl font-bold mb-4">ניהול עובדים</h3>
+                        <ul id="workers-list" class="space-y-2 mb-4"></ul>
+                        <button class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2 px-4 rounded-lg">הוסף עובד +</button>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="text-xl font-bold mb-4">ניהול שותפים</h3>
+                        <ul id="partners-list" class="space-y-2 mb-4"></ul>
+                        <button class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2 px-4 rounded-lg">הוסף שותף +</button>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="text-xl font-bold mb-4">ניהול סוגי משימה</h3>
+                        <ul id="task-types-list" class="space-y-2 mb-4"></ul>
+                        <button class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2 px-4 rounded-lg">הוסף סוג +</button>
+                    </div>
+                </div>
+                 <div class="mt-8 bg-white p-6 rounded-xl shadow-md">
+                    <h3 class="text-xl font-bold mb-4">✔️ סנכרון לקוחות</h3>
+                    <p class="text-slate-600 mb-4">רשימת הלקוחות נשמרת ב-Firestore ומשמשת להשלמה אוטומטית. ניתן לייבא לקוחות נוספים ידנית מתוך קובץ Excel דרך תהליך מותאם אישית (דורש לוגיקת צד שרת). העדכון האחרון בוצע ב: <span class="font-semibold" id="last-sync-date"></span>.</p>
+                    <button id="manual-import-excel-btn" class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg transition duration-300">ייבוא ידני מ-Excel</button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal for Add/Edit Task -->
+    <div id="task-modal" class="modal-bg fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-2xl transform transition-all" id="modal-content">
+            <h2 id="modal-title" class="text-2xl font-bold mb-6">הוספת משימה חדשה</h2>
+            <form id="task-form">
+                <input type="hidden" id="task-id">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="relative">
+                        <label for="customer" class="font-semibold block mb-2">שם לקוח</label>
+                        <input type="text" id="customer" name="customer" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" autocomplete="off" required>
+                        <div id="customer-autocomplete-list" class="autocomplete-items"></div>
+                    </div>
+                    <div>
+                        <label for="partner" class="font-semibold block mb-2">שותף מטפל</label>
+                        <select id="partner" name="partner" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required></select>
+                    </div>
+                     <div>
+                        <label for="worker" class="font-semibold block mb-2">עובד מטפל</label>
+                        <select id="worker" name="worker" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required></select>
+                    </div>
+                    <div>
+                        <label for="task-type" class="font-semibold block mb-2">סוג משימה</label>
+                        <select id="task-type" name="task-type" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required></select>
+                    </div>
+                    <div>
+                        <label for="status" class="font-semibold block mb-2">סטטוס משימה</label>
+                        <select id="status" name="status" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required></select>
+                    </div>
+                    <div>
+                        <label for="priority" class="font-semibold block mb-2">עדיפות</label>
+                        <select id="priority" name="priority" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required></select>
+                    </div>
+                    <div class="md:col-span-2">
+                        <label for="due-date" class="font-semibold block mb-2">תאריך יעד</label>
+                        <input type="date" id="due-date" name="due-date" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md" required>
+                    </div>
+                    <div class="md:col-span-2">
+                        <div class="flex items-center mb-2">
+                            <label for="notes" class="font-semibold block flex-grow">הערות</label>
+                            <button type="button" id="generate-notes-btn" class="bg-purple-200 text-purple-800 text-sm font-semibold py-1 px-3 rounded-full hover:bg-purple-300 transition duration-200 flex items-center">
+                                ✨ צור הערות/סדר יום
+                                <div id="notes-loading-spinner" class="loading-spinner"></div>
+                            </button>
+                        </div>
+                        <textarea id="notes" name="notes" rows="4" class="w-full p-3 bg-slate-100 border-slate-300 rounded-md"></textarea>
+                    </div>
+                </div>
+                <div class="mt-8 flex justify-end items-center space-i-4">
+                    <button type="button" id="cancel-btn" class="bg-slate-200 text-slate-700 font-bold py-2 px-5 rounded-lg">ביטול</button>
+                    <button type="submit" class="bg-teal-500 hover:bg-teal-600 text-white font-bold py-2 px-5 rounded-lg">שמור משימה</button>
+                     <button type="button" id="delete-btn" class="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-5 rounded-lg hidden">מחק משימה</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+
+<script type="module">
+    // Import Firebase modules (already done in the head)
+    // Access them globally as they are attached to window by the init script
+    const db = window.firebaseDb;
+    const auth = window.firebaseAuth;
+    const getCurrentUserId = window.getCurrentUserId;
+    const isFirebaseAuthReady = window.isFirebaseAuthReady;
+
+    // Define Firestore collection paths
+    const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'; // Use the __app_id from the environment
+
+    // Define collection paths for Firestore
+    const COLLECTIONS = {
+        tasks: (userId) => `artifacts/${APP_ID}/users/${userId}/tasks`,
+        customers: (userId) => `artifacts/${APP_ID}/users/${userId}/customers`,
+        partners: (userId) => `artifacts/${APP_ID}/users/${userId}/partners`,
+        workers: (userId) => `artifacts/${APP_ID}/users/${userId}/workers`,
+        taskTypes: (userId) => `artifacts/${APP_ID}/users/${userId}/taskTypes`,
+        statuses: (userId) => `artifacts/${APP_ID}/users/${userId}/statuses`,
+        priorities: (userId) => `artifacts/${APP_ID}/users/${userId}/priorities`
+    };
+
+    // Global state for the application
+    let appState = {
+        currentUserRole: 'partner',
+        currentView: 'dashboard', 
+        loggedInWorkerId: 1, // This will be set dynamically based on user role
+        filters: {
+            status: '',
+            priority: '',
+            workerId: ''
+        },
+        editingTaskId: null,
+        // Data fetched from Firestore
+        customers: [],
+        partners: [],
+        workers: [],
+        taskTypes: [],
+        statuses: {}, // Object for status metadata
+        priorities: {} // Object for priority metadata
+    };
+
+    // Firebase listeners and data population
+    let unsubscribeTasks = null;
+    let unsubscribeCustomers = null;
+    let unsubscribePartners = null;
+    let unsubscribeWorkers = null;
+    let unsubscribeTaskTypes = null;
+    let unsubscribeStatuses = null;
+    let unsubscribePriorities = null;
+
+
+    window.addEventListener('firebaseAuthReady', async () => {
+        // Ensure Firestore and Auth are initialized before trying to use them
+        if (db && auth && getCurrentUserId()) {
+            await setupFirestoreListeners();
+            // Initial render based on the default role, now with potentially real data
+            switchRole(appState.currentUserRole);
+        } else {
+            console.error("Firebase not fully initialized when auth ready event fired.");
+            // Fallback to mock data if Firebase isn't ready (e.g., error during init)
+            appState.customers = mockInitialData.customers;
+            appState.partners = mockInitialData.partners;
+            appState.workers = mockInitialData.workers;
+            appState.taskTypes = mockInitialData.taskTypes;
+            appState.statuses = mockInitialData.statuses;
+            appState.priorities = mockInitialData.priorities;
+            renderAllDropdowns();
+            switchRole(appState.currentUserRole);
+        }
+    });
+
+    async function setupFirestoreListeners() {
+        const userId = getCurrentUserId();
+        if (!userId || !db) return;
+
+        // Common handler for collection snapshots
+        const createSnapshotListener = (collectionName, stateKey, isObjectMap = false, defaultData = []) => {
+            const q = query(collection(db, COLLECTIONS[collectionName](userId)));
+            return onSnapshot(q, (snapshot) => {
+                const data = [];
+                snapshot.forEach(doc => {
+                    data.push({ id: doc.id, ...doc.data() });
+                });
+                if (isObjectMap) {
+                    // Convert array of objects to a map if needed (e.g., for statuses/priorities)
+                    appState[stateKey] = data.reduce((acc, item) => {
+                        if (item.name) { // Assuming 'name' is the key for these objects
+                            acc[item.name] = { ...item };
+                        } else if (item.statusName) { // Example for 'statuses'
+                            acc[item.statusName] = { color: item.color, text: item.text };
+                        } else if (item.priorityName) { // Example for 'priorities'
+                             acc[item.priorityName] = { color: item.color, text: item.text };
+                        }
+                        return acc;
+                    }, {});
+                     // If no data is fetched, populate with default mock data
+                    if (Object.keys(appState[stateKey]).length === 0 && Object.keys(defaultData).length > 0) {
+                        appState[stateKey] = defaultData;
+                         // Add default data to Firestore if collection is empty
+                        Object.keys(defaultData).forEach(async (key) => {
+                             const docRef = doc(db, COLLECTIONS[collectionName](userId), key);
+                             await setDoc(docRef, { name: key, ...defaultData[key] }, { merge: true });
+                        });
+                    }
+                } else {
+                    appState[stateKey] = data;
+                    // If no data is fetched, populate with default mock data
+                    if (appState[stateKey].length === 0 && defaultData.length > 0) {
+                         defaultData.forEach(async (item) => {
+                             await addDoc(collection(db, COLLECTIONS[collectionName](userId)), item);
+                         });
+                    }
+                }
+                renderAllDropdowns(); // Re-render all dropdowns after data update
+                if (collectionName === 'tasks') {
+                    appState.tasks = data; // Update appState.tasks here to use Firestore data
+                    renderTasks();
+                    renderCharts();
+                }
+                 console.log(`Loaded ${collectionName}:`, appState[stateKey]);
+            }, (error) => {
+                console.error(`Error listening to ${collectionName}:`, error);
+                 // Fallback to mock data on error
+                if (isObjectMap) {
+                     appState[stateKey] = defaultData;
+                } else {
+                     appState[stateKey] = defaultData;
+                }
+                renderAllDropdowns();
+                if (collectionName === 'tasks') {
+                    appState.tasks = []; // Clear tasks on error or use a known default
+                    renderTasks();
+                    renderCharts();
+                }
+            });
+        };
+
+        // Initialize listeners. If collections are empty, they will be populated with mock data automatically.
+        unsubscribeCustomers = createSnapshotListener('customers', 'customers', false, mockInitialData.customers.map(name => ({ name })));
+        unsubscribePartners = createSnapshotListener('partners', 'partners', false, mockInitialData.partners);
+        unsubscribeWorkers = createSnapshotListener('workers', 'workers', false, mockInitialData.workers);
+        unsubscribeTaskTypes = createSnapshotListener('taskTypes', 'taskTypes', false, mockInitialData.taskTypes.map(name => ({ name })));
+        unsubscribeStatuses = createSnapshotListener('statuses', 'statuses', true, mockInitialData.statuses);
+        unsubscribePriorities = createSnapshotListener('priorities', 'priorities', true, mockInitialData.priorities);
+        unsubscribeTasks = createSnapshotListener('tasks', 'tasks', false); // Tasks are loaded last as they depend on other data
+    }
+
+
+    const mockInitialData = {
+        customers: ["לקוח א'", "לקוח ב'", "חברת תקשורת גדולה", "סטארטאפ מתפתח", "משרד ממשלתי", "לקוח חדש 1", "לקוח ניסיון 2"],
+        partners: [{name: "אבי כהן"}, {name: "יוסי לוי"}], // Removed ID, Firestore will provide
+        workers: [{name: "דנה ישראלי"}, {name: "משה פרץ"}, {name: "גלית בר"}], // Removed ID, Firestore will provide
+        taskTypes: ["פגישה", "שיחת טלפון", "הצעת מחיר", "טיפול בתקלה", "פיתוח פיצ'ר"],
+        statuses: {
+            "טרם התחיל": { color: 'bg-red-500', text: 'text-white', statusName: "טרם התחיל" },
+            "בתהליך": { color: 'bg-yellow-400', text: 'text-slate-800', statusName: "בתהליך" },
+            "בהמתנה": { color: 'bg-blue-500', text: 'text-white', statusName: "בהמתנה" },
+            "בוצע": { color: 'bg-green-500', text: 'text-white', statusName: "בוצע" },
+            "נדחה": { color: 'bg-gray-500', text: 'text-white', statusName: "נדחה" },
+        },
+        priorities: {
+            "גבוהה": { color: 'bg-red-200', text: 'text-red-800', priorityName: "גבוהה" },
+            "בינונית": { color: 'bg-yellow-200', text: 'text-yellow-800', priorityName: "בינונית" },
+            "נמוכה": { color: 'bg-green-200', text: 'text-green-800', priorityName: "נמוכה" },
+        }
+    };
+    
+    // tasks will be updated by Firestore snapshot listener, no longer a separate array
+    // let tasks = []; 
+
+    const statusChartEl = document.getElementById('statusChart');
+    const tasksPerWorkerChartEl = document.getElementById('tasksPerWorkerChart');
+    let statusChart, tasksPerWorkerChart;
+
+    // Populates select dropdowns with data
+    function populateSelect(elementId, data, options = {}) {
+        const select = document.getElementById(elementId);
+        if (!select) return;
+        select.innerHTML = options.placeholder ? `<option value="">${options.placeholder}</option>` : '';
+        const dataArray = Array.isArray(data) ? data : Object.keys(data); // Can be array or object keys
+        dataArray.forEach(item => {
+            const value = typeof item === 'object' ? (item.id || item.name) : item; // Use id or name for value
+            const text = typeof item === 'object' ? (item.name || item.statusName || item.priorityName || item.id) : item; // Use name, statusName, priorityName, or id for text
+            select.innerHTML += `<option value="${value}">${text}</option>`;
+        });
+    }
+
+    function renderAllDropdowns() {
+        // Populating filters (with general mock data fallback)
+        populateSelect('status-filter', Object.keys(appState.statuses).length > 0 ? appState.statuses : mockInitialData.statuses, { placeholder: 'כל הסטטוסים' });
+        populateSelect('priority-filter', Object.keys(appState.priorities).length > 0 ? appState.priorities : mockInitialData.priorities, { placeholder: 'כל העדיפויות' });
+        populateSelect('worker-filter', appState.workers.length > 0 ? appState.workers : mockInitialData.workers, { placeholder: 'כל העובדים' });
+        
+        // Populating form dropdowns
+        autocomplete(document.getElementById("customer"), appState.customers.map(c => c.name)); // Autocomplete uses names
+        populateSelect('partner', appState.partners.length > 0 ? appState.partners : mockInitialData.partners);
+        populateSelect('worker', appState.workers.length > 0 ? appState.workers : mockInitialData.workers);
+        populateSelect('task-type', appState.taskTypes.length > 0 ? appState.taskTypes : mockInitialData.taskTypes.map(t => t.name));
+        populateSelect('status', Object.keys(appState.statuses).length > 0 ? appState.statuses : mockInitialData.statuses);
+        populateSelect('priority', Object.keys(appState.priorities).length > 0 ? appState.priorities : mockInitialData.priorities);
+    }
+
+    // Renders the list of tasks based on current filters and user role
+    function renderTasks() {
+        const taskListContainer = document.getElementById('task-list');
+        taskListContainer.innerHTML = '';
+        
+        let filteredTasks = appState.tasks;
+
+        // Apply worker-specific filter if current user is a worker
+        if (appState.currentUserRole === 'worker') {
+            const currentWorker = appState.workers.find(w => w.id === getCurrentUserId());
+            if (currentWorker) {
+                filteredTasks = appState.tasks.filter(task => task.workerId === currentWorker.id);
+                // Also assign the loggedInWorkerId for internal use
+                appState.loggedInWorkerId = currentWorker.id;
+            } else {
+                 filteredTasks = []; // No worker found for current user ID
+            }
+        }
+
+        // Apply general filters
+        if (appState.filters.status) {
+            filteredTasks = filteredTasks.filter(task => task.status === appState.filters.status);
+        }
+        if (appState.filters.priority) {
+            filteredTasks = filteredTasks.filter(task => task.priority === appState.filters.priority);
+        }
+        if (appState.filters.workerId) {
+            filteredTasks = filteredTasks.filter(task => task.workerId === appState.filters.workerId);
+        }
+
+        if(filteredTasks.length === 0) {
+            taskListContainer.innerHTML = `<div class="col-span-full text-center text-slate-500 py-10">
+                <p class="text-xl">לא נמצאו משימות התואמות את הסינון.</p>
+            </div>`;
+            return;
+        }
+        
+        filteredTasks.forEach(task => {
+            const worker = appState.workers.find(w => w.id === task.workerId)?.name || 'לא משויך';
+            const statusStyle = appState.statuses[task.status] || { color: 'bg-gray-400', text: 'text-white' };
+            const priorityStyle = appState.priorities[task.priority] || { color: 'bg-gray-200', text: 'text-gray-800' };
+
+            const card = `
+                <div class="bg-white rounded-xl shadow-lg p-5 flex flex-col justify-between cursor-pointer hover:shadow-xl hover:-translate-y-1 transition-all duration-300 task-card" data-task-id="${task.id}">
+                    <div>
+                        <div class="flex justify-between items-start mb-2">
+                             <span class="font-bold text-lg text-slate-800">${task.customer}</span>
+                             <span class="text-sm font-semibold px-3 py-1 rounded-full ${priorityStyle.color} ${priorityStyle.text}">${task.priority}</span>
+                        </div>
+                        <p class="text-slate-600 mb-4">${task.taskType}</p>
+                    </div>
+                    <div>
+                        <div class="text-sm text-slate-500 mb-3">
+                            <p>עובד: <strong>${worker}</strong></p>
+                            <p>תאריך יעד: <strong class="${new Date(task.dueDate) < new Date() && task.status !== 'בוצע' ? 'text-red-600' : ''}">${new Date(task.dueDate).toLocaleDateString('he-IL')}</strong></p>
+                        </div>
+                        <div class="text-center font-bold px-4 py-2 rounded-md ${statusStyle.color} ${statusStyle.text}">
+                            ${task.status}
+                        </div>
+                    </div>
+                </div>
+            `;
+            taskListContainer.innerHTML += card;
+        });
+    }
+
+    // Renders the dashboard charts (status and tasks per worker)
+    function renderCharts() {
+        if (statusChart) statusChart.destroy();
+        if (tasksPerWorkerChart) tasksPerWorkerChart.destroy();
+
+        if (appState.currentUserRole !== 'partner' || appState.currentView !== 'dashboard') {
+            return;
+        }
+
+        const statusCounts = appState.tasks.reduce((acc, task) => {
+            acc[task.status] = (acc[task.status] || 0) + 1;
+            return acc;
+        }, {});
+
+        const openTasks = appState.tasks.filter(t => t.status !== 'בוצע');
+        const tasksPerWorkerCounts = openTasks.reduce((acc, task) => {
+            const worker = appState.workers.find(w => w.id === task.workerId);
+            const workerName = worker ? worker.name : 'לא ידוע';
+            acc[workerName] = (acc[workerName] || 0) + 1;
+            return acc;
+        }, {});
+
+        const statusChartData = {
+            labels: Object.keys(statusCounts),
+            datasets: [{
+                data: Object.values(statusCounts),
+                backgroundColor: Object.keys(statusCounts).map(s => (appState.statuses[s] && appState.statuses[s].color) ? appState.statuses[s].color.replace('bg-', '').replace('-500', '').replace('-400', '') : '#ccc'),
+                borderColor: '#fff',
+                borderWidth: 2,
+            }]
+        };
+
+        const tasksPerWorkerData = {
+            labels: Object.keys(tasksPerWorkerCounts),
+            datasets: [{
+                label: 'משימות פתוחות',
+                data: Object.values(tasksPerWorkerCounts),
+                backgroundColor: 'rgba(30, 144, 255, 0.6)',
+                borderColor: 'rgba(30, 144, 255, 1)',
+                borderWidth: 1
+            }]
+        };
+        
+        statusChart = new Chart(statusChartEl, {
+            type: 'doughnut',
+            data: statusChartData,
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'top' } }
+            }
+        });
+        
+        tasksPerWorkerChart = new Chart(tasksPerWorkerChartEl, {
+            type: 'bar',
+            data: tasksPerWorkerData,
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+                plugins: { legend: { display: false } }
+            }
+        });
+    }
+    
+    // Renders the settings view content
+    function renderSettings() {
+        if (appState.currentUserRole !== 'partner' || appState.currentView !== 'settings') return;
+        
+        document.getElementById('workers-list').innerHTML = appState.workers.map(w => `<li class="bg-slate-100 p-2 rounded-md">${w.name}</li>`).join('');
+        document.getElementById('partners-list').innerHTML = appState.partners.map(p => `<li class="bg-slate-100 p-2 rounded-md">${p.name}</li>`).join('');
+        document.getElementById('task-types-list').innerHTML = appState.taskTypes.map(t => `<li class="bg-slate-100 p-2 rounded-md">${t.name}</li>`).join('');
+        document.getElementById('last-sync-date').innerText = new Date().toLocaleDateString('he-IL'); // Always show current date for sync as it's not a real sync
+    }
+
+    // Handles switching between different main views (Dashboard, Tasks, Settings)
+    function switchView(view) {
+        appState.currentView = view;
+        document.querySelectorAll('.view-content').forEach(v => v.classList.add('hidden'));
+        document.getElementById(`${view}-view`).classList.remove('hidden');
+        
+        document.querySelectorAll('.nav-tab').forEach(tab => {
+            if (tab.dataset.view === view) {
+                tab.classList.add('border-teal-500', 'text-teal-600');
+                tab.classList.remove('border-transparent', 'text-slate-500');
+            } else {
+                tab.classList.remove('border-teal-500', 'text-teal-600');
+                tab.classList.add('border-transparent', 'text-slate-500');
+            }
+        });
+
+        if (view === 'dashboard') renderCharts();
+        if (view === 'tasks') renderTasks();
+        if (view === 'settings') renderSettings();
+    }
+    
+    // Handles switching between user roles (Partner, Worker)
+    function switchRole(role) {
+        appState.currentUserRole = role;
+        const partnerNav = document.getElementById('partner-nav');
+        const workerFilter = document.getElementById('worker-filter');
+        const tasksViewIntro = document.getElementById('tasks-view-intro');
+        
+        document.querySelectorAll('.user-role-btn').forEach(btn => {
+            if (btn.dataset.role === role) {
+                btn.classList.add('bg-teal-500', 'text-white');
+                btn.classList.remove('bg-transparent', 'text-slate-600');
+            } else {
+                btn.classList.remove('bg-teal-500', 'text-white');
+                btn.classList.add('bg-transparent', 'text-slate-600');
+            }
+        });
+
+        if (role === 'partner') {
+            partnerNav.style.display = 'block';
+            workerFilter.style.display = 'block'; // Worker filter visible for partner
+            tasksViewIntro.innerText = "כאן ניתן לנהל ולצפות בכל המשימות. השתמשו בסננים כדי למצוא בקלות את המשימות הרלוונטיות, ולחצו על כפתור 'הוסף משימה' כדי ליצור משימה חדשה.";
+            switchView('dashboard'); // Default view for partner
+        } else {
+            partnerNav.style.display = 'none';
+            workerFilter.style.display = 'none'; // Worker filter hidden for worker
+            appState.filters.workerId = ''; // Clear worker filter when switching to worker role
+            document.getElementById('worker-filter').value = '';
+            tasksViewIntro.innerText = "זהו מסך המשימות האישי שלך. כאן תוכל לראות את כל המשימות שהוקצו לך, לעדכן את הסטטוס שלהן ולסנן אותן לפי הצורך.";
+            switchView('tasks'); // Default view for worker
+        }
+    }
+    
+    // Shows the modal for adding or editing a task
+    function showModal(taskId = null) {
+        const modal = document.getElementById('task-modal');
+        const modalTitle = document.getElementById('modal-title');
+        const form = document.getElementById('task-form');
+        const deleteBtn = document.getElementById('delete-btn');
+        form.reset(); // Clear form fields
+        
+        appState.editingTaskId = taskId;
+
+        if (taskId) {
+            modalTitle.innerText = "עריכת משימה";
+            const task = appState.tasks.find(t => t.id === taskId);
+            // Populate form with task data
+            document.getElementById('task-id').value = task.id;
+            document.getElementById('customer').value = task.customer;
+            document.getElementById('partner').value = task.partnerId;
+            document.getElementById('worker').value = task.workerId;
+            document.getElementById('task-type').value = task.taskType;
+            document.getElementById('status').value = task.status;
+            document.getElementById('priority').value = task.priority;
+            document.getElementById('due-date').value = task.dueDate;
+            document.getElementById('notes').value = task.notes;
+            deleteBtn.classList.remove('hidden'); // Show delete button for existing tasks
+        } else {
+            modalTitle.innerText = "הוספת משימה חדשה";
+            document.getElementById('status').value = "טרם התחיל"; // Default status for new task
+            deleteBtn.classList.add('hidden'); // Hide delete button for new tasks
+        }
+
+        modal.style.display = 'flex'; // Show modal
+        // Add a slight delay for transition effect
+        setTimeout(() => {
+            document.getElementById('modal-content').style.opacity = 1;
+            document.getElementById('modal-content').style.transform = 'translateY(0)';
+        }, 10);
+    }
+    
+    // Hides the modal
+    function hideModal() {
+        const modal = document.getElementById('task-modal');
+        // Add transition effect
+        document.getElementById('modal-content').style.opacity = 0;
+        document.getElementById('modal-content').style.transform = 'translateY(-20px)';
+        setTimeout(() => {
+            modal.style.display = 'none'; // Hide modal after transition
+            appState.editingTaskId = null; // Clear editing state
+        }, 300);
+    }
+
+    // Function to handle autocomplete for the customer input
+    function autocomplete(inp, arr) {
+        let currentFocus;
+        // Remove previous listeners to avoid duplicates when re-initializing
+        inp.removeEventListener("input", inp._handlerInput);
+        inp.removeEventListener("keydown", inp._handlerKeydown);
+        // We use a global click handler that is removed and re-added to ensure it's always only one
+        document.removeEventListener("click", inp._handlerClick);
+
+        inp._handlerInput = function(e) {
+            let a, b, i, val = this.value;
+            closeAllLists(); // Close any already open lists
+            if (!val) { return false;}
+            currentFocus = -1;
+            let autocompleteListDiv = document.getElementById(this.id + "autocomplete-list");
+            if(autocompleteListDiv) autocompleteListDiv.parentNode.removeChild(autocompleteListDiv); // Ensure only one list
+            a = document.createElement("DIV");
+            a.setAttribute("id", this.id + "autocomplete-list");
+            a.setAttribute("class", "autocomplete-items");
+            this.parentNode.appendChild(a); // Append the DIV as a child of the autocomplete container
+            for (i = 0; i < arr.length; i++) {
+                // Changed to includes for broader matching (case-insensitive)
+                if (arr[i].toUpperCase().includes(val.toUpperCase())) { 
+                    b = document.createElement("DIV");
+                    let matchStart = arr[i].toUpperCase().indexOf(val.toUpperCase());
+                    b.innerHTML = arr[i].substring(0, matchStart) + "<strong>" + arr[i].substring(matchStart, matchStart + val.length) + "</strong>" + arr[i].substring(matchStart + val.length);
+                    b.innerHTML += "<input type='hidden' value='" + arr[i] + "'>";
+                    b.addEventListener("click", function(e) {
+                        inp.value = this.getElementsByTagName("input")[0].value;
+                        closeAllLists();
+                    });
+                    a.appendChild(b);
+                }
+            }
+        };
+        inp.addEventListener("input", inp._handlerInput);
+
+        inp._handlerKeydown = function(e) {
+            let x = document.getElementById(this.id + "autocomplete-list");
+            if (x) x = x.getElementsByTagName("div");
+            if (e.keyCode == 40) { // DOWN arrow key
+                currentFocus++;
+                addActive(x);
+            } else if (e.keyCode == 38) { // UP arrow key
+                currentFocus--;
+                addActive(x);
+            } else if (e.keyCode == 13) { // ENTER key
+                e.preventDefault();
+                if (currentFocus > -1) {
+                    if (x) x[currentFocus].click();
+                }
+            }
+        };
+        inp.addEventListener("keydown", inp._handlerKeydown);
+
+        function addActive(x) {
+            if (!x) return false;
+            removeActive(x);
+            if (currentFocus >= x.length) currentFocus = 0;
+            if (currentFocus < 0) currentFocus = (x.length - 1);
+            x[currentFocus].classList.add("autocomplete-active");
+        }
+
+        function removeActive(x) {
+            for (let i = 0; i < x.length; i++) {
+                x[i].classList.remove("autocomplete-active");
+            }
+        }
+
+        inp._handlerClick = function (e) {
+            closeAllLists(e.target);
+        };
+        document.addEventListener("click", inp._handlerClick);
+
+        function closeAllLists(elmnt) {
+            let x = document.getElementsByClassName("autocomplete-items");
+            for (let i = 0; i < x.length; i++) {
+                if (elmnt != x[i] && elmnt != inp) {
+                    x[i].parentNode.removeChild(x[i]);
+                }
+            }
+        }
+    }
+
+
+    // Calls the Gemini API to generate notes/agenda
+    async function callGeminiAPI(prompt) {
+        const loadingSpinner = document.getElementById('notes-loading-spinner');
+        loadingSpinner.style.display = 'inline-block';
+
+        let chatHistory = [];
+        chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+        const payload = { contents: chatHistory };
+        const apiKey = "" // API Key will be provided by the Canvas environment at runtime.
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                return result.candidates[0].content.parts[0].text;
+            } else {
+                console.error("Gemini API returned an unexpected structure:", result);
+                return "אירעה שגיאה ביצירת הערות. אנא נסה שוב.";
+            }
+        } catch (error) {
+            console.error("Error calling Gemini API:", error);
+            return "אירעה שגיאה בתקשורת עם ה-API. אנא נסה שוב מאוחר יותר.";
+        } finally {
+            loadingSpinner.style.display = 'none';
+        }
+    }
+
+    // --- Firestore Operations ---
+
+    async function addTaskToFirestore(taskData) {
+        const userId = getCurrentUserId();
+        if (!userId) { console.error("No user ID available for adding task."); return; }
+        try {
+            const docRef = await addDoc(collection(db, COLLECTIONS.tasks(userId)), {
+                ...taskData,
+                createdAt: new Date().toISOString()
+            });
+            // If new customer, add it to customers collection
+            const customerName = taskData.customer;
+            if (customerName && !appState.customers.some(c => c.name === customerName)) {
+                await addDoc(collection(db, COLLECTIONS.customers(userId)), { name: customerName });
+            }
+            console.log("Task added with ID: ", docRef.id);
+            return { id: docRef.id, ...taskData };
+        } catch (e) {
+            console.error("Error adding document: ", e);
+        }
+    }
+
+    async function updateTaskInFirestore(taskId, updatedData) {
+        const userId = getCurrentUserId();
+        if (!userId) { console.error("No user ID available for updating task."); return; }
+        try {
+            const docRef = doc(db, COLLECTIONS.tasks(userId), taskId);
+            await updateDoc(docRef, {
+                ...updatedData,
+                updatedAt: new Date().toISOString()
+            });
+             // If customer name changed and it's new, add it to customers collection
+            const customerName = updatedData.customer;
+            if (customerName && !appState.customers.some(c => c.name === customerName)) {
+                await addDoc(collection(db, COLLECTIONS.customers(userId)), { name: customerName });
+            }
+            console.log("Task updated: ", taskId);
+            return true;
+        } catch (e) {
+            console.error("Error updating document: ", e);
+            return false;
+        }
+    }
+
+    async function deleteTaskFromFirestore(taskId) {
+        const userId = getCurrentUserId();
+        if (!userId) { console.error("No user ID available for deleting task."); return; }
+        try {
+            await deleteDoc(doc(db, COLLECTIONS.tasks(userId), taskId));
+            console.log("Task deleted: ", taskId);
+            return true;
+        } catch (e) {
+            console.error("Error deleting document: ", e);
+            return false;
+        }
+    }
+
+    // --- Initialization and Event Listeners ---
+
+    function init() {
+        // Event listeners for role switching
+        document.getElementById('user-role-switcher').addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON') {
+                switchRole(e.target.dataset.role);
+            }
+        });
+        
+        // Event listener for navigation tabs (partner-only)
+        document.querySelector('#partner-nav').addEventListener('click', (e) => {
+            if (e.target.classList.contains('nav-tab')) {
+                switchView(e.target.dataset.view);
+            }
+        });
+
+        // Event listeners for filter changes
+        document.querySelectorAll('.filter-input').forEach(input => {
+            input.addEventListener('change', (e) => {
+                const filterType = e.target.id.split('-')[0];
+                const value = e.target.value;
+                if(filterType === 'worker') {
+                    appState.filters.workerId = value;
+                } else {
+                    appState.filters[filterType] = value;
+                }
+                renderTasks();
+            });
+        });
+        
+        // Event listener for Add Task button
+        document.getElementById('add-task-btn').addEventListener('click', () => showModal());
+
+        // Event listener for clicking on a task card (to edit)
+        document.getElementById('task-list').addEventListener('click', (e) => {
+            const card = e.target.closest('.task-card');
+            if (card) {
+                showModal(card.dataset.taskId); // Use ID from Firestore
+            }
+        });
+
+        // Event listener for modal cancel button
+        document.getElementById('cancel-btn').addEventListener('click', hideModal);
+        
+        // Event listener for task form submission
+        document.getElementById('task-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const taskData = {
+                customer: formData.get('customer'),
+                partnerId: formData.get('partner'), // Use ID from dropdown
+                workerId: formData.get('worker'), // Use ID from dropdown
+                taskType: formData.get('task-type'),
+                status: formData.get('status'),
+                priority: formData.get('priority'),
+                dueDate: formData.get('due-date'),
+                notes: formData.get('notes'),
+            };
+
+            if (appState.editingTaskId) {
+                await updateTaskInFirestore(appState.editingTaskId, taskData);
+            } else {
+                await addTaskToFirestore(taskData);
+            }
+
+            hideModal();
+            // Data will re-render automatically via Firestore snapshots
+        });
+        
+        // Event listener for delete task button
+        document.getElementById('delete-btn').addEventListener('click', async () => {
+             if (appState.editingTaskId) { // In a real application, a custom confirmation modal would be used instead of `confirm()`
+                const confirmed = confirm('האם אתה בטוח שברצונך למחוק משימה זו?');
+                if (confirmed) {
+                    await deleteTaskFromFirestore(appState.editingTaskId);
+                    hideModal();
+                    // Data will re-render automatically via Firestore snapshots
+                }
+            }
+        });
+
+        // Event listener for Gemini API notes generation button
+        document.getElementById('generate-notes-btn').addEventListener('click', async () => {
+            const currentNotes = document.getElementById('notes').value;
+            const taskType = document.getElementById('task-type').value;
+            let prompt = '';
+
+            if (taskType === 'פגישה') {
+                prompt = `צור סדר יום מפורט לפגישה בנושא: "${currentNotes}". אם ההערות קצרות מדי, הצע נושאים אפשריים לפגישה זו.`;
+            } else {
+                prompt = `הרחב את הערות המשימה הבאות ופרט אותן למשימות משנה, או הצע תיאור מפורט יותר בהתאם לסוג המשימה '${taskType}': "${currentNotes}". אם ההערות ריקות, הצע תיאור כללי למשימה מסוג זה.`;
+            }
+            const generatedText = await callGeminiAPI(prompt);
+            document.getElementById('notes').value = generatedText;
+        });
+
+        // Event listener for manual Excel import button
+        document.getElementById('manual-import-excel-btn').addEventListener('click', () => {
+            console.log("ייבוא ידני מ-Excel נלחץ.");
+            alert("פונקציונליות זו דורשת תהליך צד שרת (Backend) שייבא את נתוני האקסל ל-Firestore. כרגע זהו placeholder בלבד.");
+        });
+
+
+        // Initial setup for dropdowns and role, will be updated by Firebase listeners
+        renderAllDropdowns();
+        switchRole('partner'); // Default role on load
+    }
+
+    // Call init only when Firebase Auth is confirmed ready
+    if (isFirebaseAuthReady()) {
+        init();
+    } else {
+        window.addEventListener('firebaseAuthReady', init);
+    }
+</script>
+
+</body>
+</html>
