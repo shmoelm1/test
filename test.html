@@ -349,9 +349,14 @@
     window.addEventListener('firebaseAuthReady', async () => {
         // Ensure Firestore and Auth are initialized before trying to use them
         if (db && auth && getCurrentUserId()) {
-            await setupFirestoreListeners();
-            // Initial render based on the default role, now with potentially real data
-            switchRole(appState.currentUserRole);
+            try { // Added try-catch around setupFirestoreListeners and init
+                await setupFirestoreListeners();
+                // Initial render based on the default role, now with potentially real data
+                switchRole(appState.currentUserRole);
+            } catch (runtimeError) {
+                console.error("Error during app initialization after Firebase Auth ready:", runtimeError);
+                alert("אירעה שגיאה בטעינת האפליקציה. אנא נסה לרענן את העמוד.");
+            }
         } else {
             console.error("Firebase not fully initialized when auth ready event fired.");
             // Fallback to mock data if Firebase isn't ready (e.g., error during init)
@@ -671,8 +676,8 @@
                 btn.classList.add('bg-teal-500', 'text-white');
                 btn.classList.remove('bg-transparent', 'text-slate-600');
             } else {
-                btn.classList.remove('bg-teal-500', 'text-white');
-                btn.classList.add('bg-transparent', 'text-slate-600');
+                tab.classList.remove('border-teal-500', 'text-teal-600');
+                tab.classList.add('border-transparent', 'text-slate-500');
             }
         });
 
@@ -1027,10 +1032,23 @@
     }
 
     // Call init only when Firebase Auth is confirmed ready
+    // Added try-catch for init call as well
     if (isFirebaseAuthReady()) {
-        init();
+        try {
+            init();
+        } catch (e) {
+            console.error("Error during initial app setup (init function):", e);
+            alert("אירעה שגיאה קריטית באתחול האפליקציה. אנא בדוק את קונסול המפתחים.");
+        }
     } else {
-        window.addEventListener('firebaseAuthReady', init);
+        window.addEventListener('firebaseAuthReady', () => {
+            try {
+                init();
+            } catch (e) {
+                console.error("Error during app setup after Firebase Auth ready (init function):", e);
+                alert("אירעה שגיאה קריטית באתחול האפליקציה לאחר האימות. אנא בדוק את קונסול המפתחים.");
+            }
+        });
     }
 </script>
 
